@@ -33,6 +33,31 @@ class ScanDeadlineExceeded(RuntimeError):
     pass
 
 
+TERMINAL_JOB_STATUSES = (
+    "inactive_inferred",
+    "offline_confirmed",
+    "deleted_confirmed",
+)
+CONFIRMED_JOB_STATUSES = ("offline_confirmed", "deleted_confirmed")
+
+
+def classify_complete_scan_miss(status, consecutive_complete_misses):
+    """Next status after one additional complete-scan absence.
+
+    A first miss stays `unknown` (queued for detail confirmation).
+    A second consecutive miss becomes `inactive_inferred`.
+    Terminal statuses are left alone.
+    """
+    next_misses = consecutive_complete_misses + 1
+    if status in CONFIRMED_JOB_STATUSES:
+        return status, None  # caller keeps existing status_source
+    if status == "inactive_inferred":
+        return status, None
+    if next_misses >= 2:
+        return "inactive_inferred", "two_complete_scan_absences"
+    return "unknown", "first_complete_scan_absence"
+
+
 def ensure_scan_time(deadline_monotonic):
     if (
         deadline_monotonic is not None
@@ -53,18 +78,7 @@ ACTIVE_OBSERVATION_SQL = text("""
         :page, :position_on_page, :global_rank,
         :views_count, :apps_count, :url, TRUE
     )
-    ON CONFLICT (run_id, job_id) DO UPDATE SET
-        observed_at = CURRENT_TIMESTAMP,
-        status = 'active',
-        status_source = 'listing',
-        page = EXCLUDED.page,
-        position_on_page = EXCLUDED.position_on_page,
-        global_rank = EXCLUDED.global_rank,
-        views_count = EXCLUDED.views_count,
-        apps_count = EXCLUDED.apps_count,
-        url = EXCLUDED.url,
-        parse_ok = TRUE,
-        parse_error = NULL
+    ON CONFLICT (run_id, job_id) DO NOTHING
 """)
 
 ACTIVATE_JOB_SQL = text("""
@@ -253,7 +267,8 @@ def require_lifecycle_schema(engine):
         missing = missing_lifecycle + missing_tables
         raise RuntimeError(
             f"Lifecycle schema is incomplete ({', '.join(missing)}). "
-            f"Run migration: {migration}"
+            f"For a fresh database run schema.sql in the repository root. "
+            f"Historical journal step (existing DBs only): {migration}"
         )
     if missing_analysis:
         migration = os.path.join(
@@ -263,7 +278,8 @@ def require_lifecycle_schema(engine):
         )
         raise RuntimeError(
             f"Job analysis schema is incomplete ({', '.join(missing_analysis)}). "
-            f"Run migration: {migration}"
+            f"For a fresh database run schema.sql in the repository root. "
+            f"Historical journal step (existing DBs only): {migration}"
         )
     if missing_operational:
         migration = os.path.join(
@@ -273,7 +289,8 @@ def require_lifecycle_schema(engine):
         )
         raise RuntimeError(
             f"Job operational schema is incomplete ({', '.join(missing_operational)}). "
-            f"Run migration: {migration}"
+            f"For a fresh database run schema.sql in the repository root. "
+            f"Historical journal step (existing DBs only): {migration}"
         )
     if missing_semantic:
         migration = os.path.join(
@@ -283,7 +300,8 @@ def require_lifecycle_schema(engine):
         )
         raise RuntimeError(
             f"Job analysis semantics are incomplete ({', '.join(missing_semantic)}). "
-            f"Run migration: {migration}"
+            f"For a fresh database run schema.sql in the repository root. "
+            f"Historical journal step (existing DBs only): {migration}"
         )
 
 
@@ -408,6 +426,7 @@ def finalize_complete_run(engine, run_id, run_started_at, stats):
             UPDATE public.djinni_jobs AS job
             SET
                 consecutive_complete_misses = job.consecutive_complete_misses + 1,
+                -- Keep in sync with classify_complete_scan_miss().
                 status = CASE
                     WHEN job.status IN (
                         'inactive_inferred',

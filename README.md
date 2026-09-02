@@ -1,5 +1,9 @@
 # djinni-market-etl
 
+[![ci](https://github.com/kartsan03/djinni-market-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/kartsan03/djinni-market-etl/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](requirements.txt)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 A production ETL pipeline for the Ukrainian tech job market. It reads the public pages of [djinni.co](https://djinni.co) into PostgreSQL and tracks the **lifecycle** of every posting and of a monitored cohort of candidate profiles over time — not just snapshots, but the full observation history from which metrics like time-to-close and reopen rates become computable.
 
 What it is not: no login or authenticated scraping, no contact extraction, no proxying or working around access controls, no API (Djinni doesn't have a public one, this parses HTML). It reads only pages that are visible without logging in.
@@ -21,26 +25,33 @@ Three scripts under `automation/`:
 ### Job lifecycle state machine
 
 ```
-              ┌─────────────────────────────────────────────┐
-              │  new posting ingested from its detail page   │
-              └───────────────────┬─────────────────────────┘
+              new posting ingested from its detail page
+                                  │
                                   ▼
                              ┌────────┐   seen again on a later scan
         ┌───────────────────▶│ active │◀────────────────────────────┐
-        │                    └────┬────┘            (reopen_count++) │
-        │  seen again             │                                  │
-        │─────────────────────────┤                                   │
-        ▼                         ▼                                   │
- ┌─────────────────┐    2 consecutive misses on COMPLETE scans         │
- │ offline_assumed │──────────────────────────▶┌────────────────────┐  │
- │ (1 miss, soft)  │                           │ inactive_inferred  │  │
- └────────┬────────┘                           └─────────┬──────────┘  │
-          │ detail confirms "no longer active"           │ detail 404  │
-          ▼                                              ▼             │
- ┌───────────────────┐                        ┌────────────────────┐   │
- │ offline_confirmed │                        │ deleted_confirmed  │   │
- └───────────────────┘                        └────────────────────┘   │
+        │                    └────┬────┘         (reopened_count++) │
+        │  seen again             │                                 │
+        │                         ▼                                 │
+        │              1 complete-scan miss                         │
+        │                    ┌─────────┐                            │
+        │                    │ unknown │  first_complete_scan_absence
+        │                    │ (soft)  │  queued for detail confirm │
+        │                    └────┬────┘                            │
+        │                         │ 2nd consecutive complete miss   │
+        │                         ▼                                 │
+        │              ┌────────────────────┐                       │
+        │              │ inactive_inferred  │───────────────────────┘
+        │              └─────────┬──────────┘
+        │    detail confirms     │ detail 404
+        │    "no longer active"  │
+        ▼                        ▼
+ ┌───────────────────┐  ┌────────────────────┐
+ │ offline_confirmed │  │ deleted_confirmed  │
+ └───────────────────┘  └────────────────────┘
 ```
+
+A first complete-scan miss does **not** invent a separate status. The row stays `unknown` with `status_source = first_complete_scan_absence` until a second independent complete miss promotes it to `inactive_inferred`, or a detail fetch confirms offline/deleted. Terminal statuses are never overwritten by absence.
 
 The load-bearing rule is **absence evidence discipline**. A missing job proves nothing unless the scan itself was provably complete: started at page 1, reached the end of pagination, zero parse errors, page count matches both the expected pages and the site-advertised total, duplicate drift within one page. Partial or failed runs keep their positive observations but never mass-inactivate anything. Closing requires two independent complete absences, and a broken parser that returns HTTP 200 with empty results cannot wipe the dataset because incomplete scans fail those gates by construction.
 
@@ -52,7 +63,7 @@ The load-bearing rule is **absence evidence discipline**. A missing job proves n
 | `djinni_*_scrape_runs` | When and how *completely* did we scan? (audit trail, one row per run, DB-enforced single-writer) |
 | `djinni_*_observations` | What did we *see* and when? (append-only history; raw payloads retained for re-parsing) |
 
-`first_seen_at` is immutable; all age metrics derive from it. Observations are append-only — enforced in SQL by mutation-blocking triggers, not just by convention. Every run carries its `parser_version`, so a parsing change never silently contaminates history.
+`first_seen_at` is immutable — a trigger rejects any UPDATE that would change it; all age metrics derive from it. Observation tables are append-only: UPDATE, DELETE and TRUNCATE are rejected in SQL. A duplicate sighting of the same job or candidate in the same run is ignored (`ON CONFLICT DO NOTHING`), so one run still produces at most one evidence row per entity. Every run carries its `parser_version`, so a parsing change never silently contaminates history.
 
 ### Concurrency and safety
 
@@ -79,7 +90,7 @@ createdb djinni_market          # or any database named in .env
 psql -v ON_ERROR_STOP=1 -f schema.sql
 ```
 
-`schema.sql` creates the complete final schema (tables, constraints, indexes, append-only triggers). `automation/migrations/` is the ordered journal of how this schema actually evolved on the author's database — backup-first steps, checksum-verified snapshots, rollback files — useful as a reference, not required for a fresh install.
+`schema.sql` creates the complete final schema: tables, constraints, indexes, analysis views, append-only observation triggers, and `first_seen_at` immutability. `automation/migrations/` is the ordered journal of how this schema actually evolved on the author's database — backup-first steps, checksum-verified snapshots, rollback files — useful as a reference, not required for a fresh install.
 
 ## Usage
 
@@ -124,7 +135,16 @@ automation/
 
 ## Analyzing the data
 
-Anything that speaks SQL works: `psql`, DBeaver, pandas (`pd.read_sql`), or a coding agent pointed at the database. List-valued fields (tags, skills, languages) are `text[]`; raw HTML-derived payloads stay in `raw_json_ld` / `raw_list` / `raw_profile` jsonb columns, so fields that were never normalized can still be extracted retroactively — you can re-parse history, you can never re-scrape it.
+Anything that speaks SQL works: `psql`, DBeaver, pandas (`pd.read_sql`), or a coding agent pointed at the database. Four views ship in `schema.sql`:
+
+| View | What it is |
+|---|---|
+| `v_jobs_current` | Current vacancy snapshot, including `lifecycle_duration_observable` |
+| `v_job_dynamics` | Latest two engagement observations (per-hour rates; ignore windows shorter than 24h) |
+| `v_candidates_current` | Tracked cohort only — not the whole Djinni population |
+| `v_candidate_dynamics` | Latest two listing view-counts; negative deltas may be counter resets |
+
+List-valued fields (tags, skills, languages) are `text[]`; raw HTML-derived payloads stay in `raw_json_ld` / `raw_list` / `raw_profile` jsonb columns, so fields that were never normalized can still be extracted retroactively — you can re-parse history, you can never re-scrape it.
 
 ## Limitations
 
@@ -145,3 +165,5 @@ This tool reads only pages visible without logging in and does not collect conta
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+See also [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).

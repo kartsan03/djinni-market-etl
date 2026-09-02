@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from reconcile_djinni_jobs import (  # noqa: E402
     ScanDeadlineExceeded,
     can_record_absence_evidence,
+    classify_complete_scan_miss,
     ensure_scan_time,
     parse_card,
     parse_site_total,
@@ -91,6 +92,24 @@ class AbsenceSafetyTests(unittest.TestCase):
         self.assertFalse(self.safe(unique_jobs_seen=7445, duplicate_cards=16))
         self.assertFalse(self.safe(errors_count=1))
         self.assertFalse(self.safe(max_pages=10))
+
+
+class MissClassificationTests(unittest.TestCase):
+    def test_first_complete_miss_stays_unknown(self):
+        status, source = classify_complete_scan_miss("active", 0)
+        self.assertEqual(status, "unknown")
+        self.assertEqual(source, "first_complete_scan_absence")
+
+    def test_second_complete_miss_becomes_inactive_inferred(self):
+        status, source = classify_complete_scan_miss("unknown", 1)
+        self.assertEqual(status, "inactive_inferred")
+        self.assertEqual(source, "two_complete_scan_absences")
+
+    def test_terminal_statuses_are_not_overwritten(self):
+        for status in ("inactive_inferred", "offline_confirmed", "deleted_confirmed"):
+            next_status, source = classify_complete_scan_miss(status, 5)
+            self.assertEqual(next_status, status)
+            self.assertIsNone(source)
 
 
 if __name__ == "__main__":

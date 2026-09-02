@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import os
 import random
@@ -583,7 +583,8 @@ def require_lifecycle_schema(engine):
     migration = os.path.join(os.path.dirname(__file__), "migrations", migration_name)
     raise RuntimeError(
         f"Candidate lifecycle schema is incomplete ({', '.join(missing)}). "
-        f"Run migration: {migration}"
+        f"For a fresh database run schema.sql in the repository root. "
+        f"Historical journal step (existing DBs only): {migration}"
     )
 
 
