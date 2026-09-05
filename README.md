@@ -1,5 +1,7 @@
 # djinni-market-etl
 
+**Status:** jobs OK · candidates confirmation-only since Aug 2026
+
 [![ci](https://github.com/kartsan03/djinni-market-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/kartsan03/djinni-market-etl/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](requirements.txt)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
