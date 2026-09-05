@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.1.1 - 2026-09-05
+
 ### Fixed
 
 - Fresh-install `schema.sql` now actually ships the analysis views, append-only observation triggers, and `first_seen_at` immutability that the README already described.
