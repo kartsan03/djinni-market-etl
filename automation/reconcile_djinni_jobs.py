@@ -8,11 +8,12 @@ import sys
 import time
 from urllib.parse import urlencode, urljoin
 
-import cloudscraper
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
+
+from djinni_http import HEADERS, create_djinni_scraper, raise_if_blocked
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -23,11 +24,6 @@ PARSER_VERSION = "job-status-v3"
 PAGE_SIZE = 15
 RECONCILE_LOCK_KEY = 84009520260729
 SCAN_DEADLINE_BUFFER_SECONDS = 60
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-}
 
 class ScanDeadlineExceeded(RuntimeError):
     pass
@@ -174,8 +170,16 @@ def parse_card(card, page, position_on_page):
         return None
 
     card_text = card.get_text(" ", strip=True)
-    views_match = re.search(r"([\d\s,]+)\s+views\b", card_text, re.IGNORECASE)
-    apps_match = re.search(r"([\d\s,]+)\s+applications\b", card_text, re.IGNORECASE)
+    views_match = re.search(
+        r"([\d\s,]+)\s+(?:views|перегляд(?:ів|и)?|просмотр(?:ов|а|ы)?)\b",
+        card_text,
+        re.IGNORECASE,
+    )
+    apps_match = re.search(
+        r"([\d\s,]+)\s+(?:applications|відгук(?:ів|и)?|заявк(?:и|ок)?|отклик(?:ов|а|и)?)\b",
+        card_text,
+        re.IGNORECASE,
+    )
 
     return {
         "djinni_id": int(id_match.group(1)),
@@ -587,8 +591,7 @@ def fetch_final_site_total(scraper):
     response = scraper.get(build_list_url(1), headers=HEADERS, timeout=20)
     response.raise_for_status()
     lowered = response.text.lower()
-    if "has been blocked" in lowered or "cf-chl-" in lowered:
-        raise RuntimeError("Block page detected during final total verification")
+    raise_if_blocked(lowered, "Block page detected during final total verification")
 
     total = parse_site_total(BeautifulSoup(response.content, "html.parser"))
     if total is None:
@@ -653,9 +656,7 @@ def run_scan(
     missing_job_handler=None,
     deadline_monotonic=None,
 ):
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
+    scraper = create_djinni_scraper()
 
     page = args.start_page
     final_requested_page = page + args.max_pages - 1 if args.max_pages else None
@@ -689,8 +690,7 @@ def run_scan(
 
             response.raise_for_status()
             lowered = response.text.lower()
-            if "has been blocked" in lowered or "cf-chl-" in lowered:
-                raise RuntimeError("Djinni/Cloudflare block page detected; refusing to reconcile statuses")
+            raise_if_blocked(lowered, "Djinni/Cloudflare block page detected; refusing to reconcile statuses")
 
             soup = BeautifulSoup(response.content, "html.parser")
             cards = soup.select(".job-item")

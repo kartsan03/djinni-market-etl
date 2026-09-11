@@ -8,20 +8,22 @@ import time
 from datetime import date, datetime, timedelta
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
-import cloudscraper
 from bs4 import BeautifulSoup, Tag
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+from djinni_http import (
+    HEADERS,
+    BlockedResponseError,
+    create_djinni_scraper,
+    raise_if_blocked,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE_URL = "https://djinni.co"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-}
 
 PARSER_VERSION = "candidate-lifecycle-v3"
 CANDIDATE_LOCK_KEY = 774_202_607
@@ -29,7 +31,6 @@ ACTIVE_CONFIRMATION_DAYS = 14
 INACTIVE_CONFIRMATION_DAYS = 30
 DETAIL_BUDGET_SECONDS = 14
 DETAIL_DEADLINE_BUFFER_SECONDS = 60
-BLOCK_MARKERS = ("has been blocked", "cf-chl-")
 OFFLINE_MARKERS = (
     "candidate is offline",
     "profile is offline",
@@ -463,10 +464,6 @@ class AmbiguousDetailError(RuntimeError):
     pass
 
 
-class BlockedResponseError(RuntimeError):
-    pass
-
-
 def parse_listing_meta(soup):
     heading = soup.find("h1")
     heading_text = normalize(heading.get_text(" ", strip=True)) if heading else None
@@ -488,8 +485,7 @@ def classify_candidate_detail_response(response, url):
 
     response.raise_for_status()
     lowered_html = response.text.lower()
-    if any(marker in lowered_html for marker in BLOCK_MARKERS):
-        raise BlockedResponseError("Djinni/Cloudflare block page detected")
+    raise_if_blocked(lowered_html)
 
     soup = BeautifulSoup(response.content, "html.parser")
     offline_evidence = []
@@ -963,168 +959,11 @@ def passes_new_candidate_filters(record, args):
 
 
 def run_incremental_listing(engine, scraper, args, run_id, prior_frontier, known, metrics, deadline):
-    page = args.start_page
-    last_page = args.start_page + args.max_pages - 1 if args.max_pages else None
-    seen_keys = set()
-    anchor_page = None
-    prior_keys = set((prior_frontier or {}).get("keys") or [])
-    prior_date = (prior_frontier or {}).get("published_date")
-    bootstrap_date = date.today()
-    stop_reason = None
-
-    while True:
-        if datetime.now() >= deadline:
-            stop_reason = "listing_budget_exhausted"
-            break
-        if last_page is not None and page > last_page:
-            stop_reason = "max_pages_reached"
-            break
-
-        list_url = build_list_url(page, args.sortby)
-        print(f"\n🚀 Candidates listing page {page}: {list_url}")
-        response = scraper.get(list_url, headers=HEADERS, timeout=args.request_timeout)
-        if response.status_code == 404:
-            stop_reason = "listing_404"
-            break
-        response.raise_for_status()
-        lowered = response.text.lower()
-        if any(marker in lowered for marker in BLOCK_MARKERS):
-            raise BlockedResponseError("Djinni blocked the listing request")
-
-        soup = BeautifulSoup(response.content, "html.parser")
-        cards = soup.select(".card.mb-4")
-        if not cards:
-            stop_reason = "no_cards"
-            break
-
-        site_total, site_pages = parse_listing_meta(soup)
-        if metrics["pages_scraped"] == 0:
-            metrics["site_reported_total_start"] = site_total
-            metrics["site_reported_pages_start"] = site_pages
-        metrics["site_reported_total_end"] = site_total
-        metrics["site_reported_pages_end"] = site_pages
-        metrics["cards_seen"] += len(cards)
-
-        parsed = []
-        for position, card in enumerate(cards, start=1):
-            record = parse_listing_card(card)
-            if not record:
-                metrics["listing_parse_errors"] += 1
-                continue
-            key = record["djinni_key"]
-            if key in seen_keys:
-                metrics["duplicate_cards"] += 1
-                continue
-            seen_keys.add(key)
-            metrics["unique_candidates_seen"] += 1
-            parsed.append((position, record))
-            if page < args.start_page + args.frontier_key_pages:
-                if metrics["new_frontier_key"] is None:
-                    metrics["new_frontier_key"] = key
-                if key not in metrics["new_frontier_keys"]:
-                    metrics["new_frontier_keys"].append(key)
-            if page == args.start_page:
-                published = record.get("published_at")
-                if published is not None and (
-                    metrics["new_frontier_published_date"] is None
-                    or published > metrics["new_frontier_published_date"]
-                ):
-                    metrics["new_frontier_published_date"] = published
-            if prior_keys and key in prior_keys and anchor_page is None:
-                anchor_page = page
-
-        if page == args.start_page:
-            drift_error = listing_parser_drift_error([record for _, record in parsed])
-            if drift_error:
-                metrics["listing_parse_errors"] += len(parsed)
-                raise RuntimeError(f"Candidate listing parser drift detected: {drift_error}")
-
-        page_existing = 0
-        page_inserted = 0
-        new_limit_reached = False
-        for position, record in parsed:
-            key = record["djinni_key"]
-            existed_before = key in known
-            if not existed_before and not passes_new_candidate_filters(record, args):
-                continue
-            if (
-                not existed_before
-                and metrics["new_candidates_inserted"] + page_inserted
-                    >= args.max_new_candidates
-            ):
-                new_limit_reached = True
-                print(
-                    f"⏸️ New-candidate cap reached ({args.max_new_candidates}); "
-                    "deferring the remaining listing cards to the next run"
-                )
-                break
-
-            if args.dry_run:
-                action = "EXISTING" if existed_before else "NEW"
-                print(
-                    f"DRY {action} {key} | views={record.get('views_count')} | "
-                    f"published={record.get('published_at')} | {record.get('title')}"
-                )
-                page_existing += int(existed_before)
-                page_inserted += int(not existed_before)
-                continue
-
-            try:
-                with engine.begin() as conn:
-                    candidate_id, inserted = upsert_listing_candidate(conn, record)
-                    insert_observation(
-                        conn, candidate_id, record, run_id, "listing",
-                        status="active", status_source="listing", page=page,
-                        sortby=args.sortby, position_on_page=position,
-                        global_rank=(page - 1) * len(cards) + position,
-                        http_status=response.status_code,
-                    )
-                known[key] = candidate_id
-                if inserted:
-                    page_inserted += 1
-                    print(f"✅ NEW {key} | views={record.get('views_count')} | {record.get('title')}")
-                else:
-                    page_existing += 1
-            except Exception as exc:
-                metrics["db_errors"] += 1
-                print(f"❌ Candidate DB write failed [{key}]: {exc}")
-
-        metrics["existing_candidates_seen"] += page_existing
-        metrics["new_candidates_inserted"] += page_inserted
-        metrics["pages_scraped"] += 1
-        print(
-            f"📄 page={page} cards={len(cards)} parsed={len(parsed)} "
-            f"existing={page_existing} inserted={page_inserted}"
-        )
-        if not args.dry_run:
-            update_run_progress(engine, run_id, metrics)
-
-        if new_limit_reached:
-            stop_reason = "new_candidate_limit_reached"
-            break
-
-        dates = [record.get("published_at") for _, record in parsed]
-        dates_are_known = bool(dates) and all(value is not None for value in dates)
-        if prior_frontier:
-            if anchor_page is None and prior_date is not None and dates_are_known and max(dates) < prior_date:
-                anchor_page = page
-                print(f"⚠️ Frontier keys disappeared; using conservative date crossing at page {page}")
-            if anchor_page is not None and page >= anchor_page + args.frontier_overlap_pages:
-                metrics["frontier_reached"] = True
-                stop_reason = "prior_frontier_overlap_complete"
-                break
-        elif dates_are_known and max(dates) < bootstrap_date:
-            metrics["frontier_reached"] = True
-            stop_reason = "bootstrap_date_boundary"
-            break
-
-        page += 1
-        time.sleep(random.uniform(args.page_sleep_min, args.page_sleep_max))
-
-    if not canonical_listing_scope(args):
-        metrics["frontier_reached"] = False
-        stop_reason = f"noncanonical_scope:{stop_reason or 'stopped'}"
-    return stop_reason or "listing_stopped"
+    # Discovery skipped: anonymous /developers/ is behind a login wall.
+    raise RuntimeError(
+        "Candidate listing discovery path invoked but is fail-loud: "
+        "/developers/ is behind a login wall for anonymous visitors."
+    )
 
 
 def count_due_candidates(engine, missing_profile=None):
@@ -1338,22 +1177,15 @@ def run_confirmations(engine, scraper, args, run_id, metrics, deadline):
 
 
 def scrape_candidates(args):
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
+    if not args.confirmation_only:
+        raise RuntimeError(
+            "Candidate listing discovery is refused: anonymous /developers/ "
+            "redirects to /login since Aug 2026. Run in confirmation-only mode "
+            "(default)."
+        )
+    scraper = create_djinni_scraper()
     metrics = initial_metrics()
     deadline = datetime.now() + timedelta(minutes=args.deadline_minutes)
-    listing_deadline = min(
-        deadline,
-        datetime.now() + timedelta(minutes=args.listing_budget_minutes),
-    )
-
-    if args.dry_run:
-        stop_reason = run_incremental_listing(
-            None, scraper, args, None, None, {}, metrics, listing_deadline
-        )
-        print(f"\nDRY RUN: PostgreSQL was not modified. stop_reason={stop_reason}")
-        return 0
 
     engine = load_engine()
     ensure_schema(engine)
@@ -1375,18 +1207,7 @@ def scrape_candidates(args):
             f"prior_frontier={prior_frontier or 'bootstrap'}"
         )
 
-        if args.confirmation_only:
-            listing_reason = "confirmation_only"
-        elif pending_backlog_before > 0:
-            listing_reason = "pending_enrichment_catchup"
-            print(
-                "⏸️ Existing listing-only profiles are still due; "
-                "skipping discovery so enrichment cannot starve."
-            )
-        else:
-            listing_reason = run_incremental_listing(
-                engine, scraper, args, run_id, prior_frontier, known, metrics, listing_deadline
-            )
+        listing_reason = "confirmation_only"
         detail_reason, confirmation_complete = run_confirmations(
             engine, scraper, args, run_id, metrics, deadline
         )
@@ -1397,13 +1218,7 @@ def scrape_candidates(args):
             and metrics["detail_request_errors"] == 0
             and metrics["db_errors"] == 0
         )
-        if args.confirmation_only:
-            scope_complete = bool(confirmation_complete and no_errors)
-        else:
-            scope_complete = bool(
-                metrics["frontier_reached"] and canonical_listing_scope(args)
-                and confirmation_complete and no_errors
-            )
+        scope_complete = bool(confirmation_complete and no_errors)
         status = "complete" if scope_complete else "partial"
         stop_reason = f"listing={listing_reason};detail={detail_reason}"
         finalize_run(engine, run_id, metrics, status, scope_complete, stop_reason)
@@ -1425,7 +1240,7 @@ def scrape_candidates(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Incrementally discover Djinni candidates and confirm a monitored cohort safely."
+        description="Confirm a monitored Djinni candidate cohort (confirmation-only by default)."
     )
     parser.add_argument("--min-views", type=int, default=0)
     parser.add_argument("--min-salary", type=int, default=0)
@@ -1439,8 +1254,10 @@ def parse_args():
         help="Bound newly tracked listing-only profiles so the detail batch can catch up.",
     )
     parser.add_argument(
-        "--confirmation-only", action="store_true",
-        help="Skip listing discovery and process only the due monitored detail batch.",
+        "--confirmation-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Confirm stored cohort only (default). --no-confirmation-only attempts discovery and is refused.",
     )
     parser.add_argument("--frontier-key-pages", type=int, default=3)
     parser.add_argument("--frontier-overlap-pages", type=int, default=2)
@@ -1454,8 +1271,15 @@ def parse_args():
     parser.add_argument("--page-sleep-max", type=float, default=20.0)
     args = parser.parse_args()
 
-    if args.confirmation_only and args.dry_run:
-        parser.error("--confirmation-only cannot be combined with --dry-run")
+    if not args.confirmation_only:
+        parser.error(
+            "Candidate listing discovery is refused: anonymous /developers/ "
+            "redirects to /login since Aug 2026. Omit --no-confirmation-only."
+        )
+    if args.dry_run:
+        parser.error(
+            "--dry-run only exercised listing discovery, which is refused (login wall)."
+        )
     if args.start_page < 1:
         parser.error("--start-page must be >= 1")
     if args.max_pages is not None and args.max_pages < 1:

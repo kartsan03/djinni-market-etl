@@ -7,11 +7,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
-import cloudscraper
 from bs4 import BeautifulSoup
 from sqlalchemy import text
 
 import reconcile_djinni_jobs as lifecycle
+from djinni_http import create_djinni_scraper, raise_if_blocked
 from telegram_alert import send_heartbeat
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -223,8 +223,7 @@ def collect_tags(soup, text_value):
 def parse_detail_response(response, url):
     response.raise_for_status()
     lowered = response.text.lower()
-    if "has been blocked" in lowered or "cf-chl-" in lowered:
-        raise RuntimeError("Djinni/Cloudflare block page detected")
+    raise_if_blocked(lowered)
 
     soup = BeautifulSoup(response.content, "html.parser")
     text_value = soup.get_text(" ", strip=True)
@@ -372,6 +371,81 @@ def insert_new_job(engine, detail, listing_record):
         """), params).scalar_one()
 
 
+
+def select_active_jobs_for_detail_refresh(engine, limit):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT id, djinni_id, url
+            FROM public.djinni_jobs
+            WHERE status = 'active' AND url IS NOT NULL
+            ORDER BY detail_scraped_at NULLS FIRST, id
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+        return [dict(row) for row in rows]
+
+
+def update_job_detail_fields(engine, djinni_id, detail):
+    params = {
+        **detail,
+        "djinni_id": djinni_id,
+        "tags": detail["tags"] or None,
+        "raw_json_ld": json.dumps(detail["raw_json_ld"], ensure_ascii=False),
+        "parser_version": PARSER_VERSION,
+    }
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE public.djinni_jobs
+            SET
+                salary_min = COALESCE(:salary_min, salary_min),
+                salary_max = COALESCE(:salary_max, salary_max),
+                salary_currency = COALESCE(:salary_currency, salary_currency),
+                salary_period = COALESCE(:salary_period, salary_period),
+                salary_source = COALESCE(:salary_source, salary_source),
+                valid_through = COALESCE(:valid_through, valid_through),
+                tags = COALESCE(:tags, tags),
+                exp_selector_months = :experience_months,
+                raw_json_ld = CAST(:raw_json_ld AS jsonb),
+                detail_scraped_at = CURRENT_TIMESTAMP,
+                last_parser_version = :parser_version
+            WHERE djinni_id = :djinni_id
+              AND status = 'active'
+        """), params)
+
+
+def refresh_active_job_details(args, deadline_monotonic=None):
+    """Budgeted re-fetch of JSON-LD fields that otherwise freeze after first ingest."""
+    if args.detail_refresh_limit <= 0 or args.dry_run:
+        return 0
+    engine = lifecycle.load_engine()
+    scraper = create_djinni_scraper()
+    targets = select_active_jobs_for_detail_refresh(engine, args.detail_refresh_limit)
+    if not targets:
+        print("Detail refresh: no active jobs queued")
+        return 0
+    refreshed = 0
+    errors = 0
+    print(f"Detail refresh: up to {len(targets)} active job(s)")
+    for row in targets:
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic - lifecycle.SCAN_DEADLINE_BUFFER_SECONDS
+        ):
+            print("Detail refresh stopped: deadline buffer reached")
+            break
+        time.sleep(random.uniform(args.detail_sleep_min, args.detail_sleep_max))
+        try:
+            response = scraper.get(row["url"], headers=lifecycle.HEADERS, timeout=15)
+            detail = parse_detail_response(response, row["url"])
+            update_job_detail_fields(engine, row["djinni_id"], detail)
+            refreshed += 1
+            print(f"♻️ refreshed [{row['djinni_id']}] salary/tags/validThrough")
+        except Exception as exc:
+            errors += 1
+            print(f"⚠️ detail refresh failed [{row['djinni_id']}]: {exc}")
+    print(f"Detail refresh done: refreshed={refreshed} errors={errors}")
+    return 1 if errors and refreshed == 0 else 0
+
+
 def build_missing_job_handler(args):
     def ingest(engine, scraper, listing_record):
         last_error = None
@@ -409,8 +483,7 @@ def classify_status_response(response):
 
     response.raise_for_status()
     lowered = response.text.lower()
-    if "has been blocked" in lowered or "cf-chl-" in lowered:
-        raise RuntimeError("Djinni/Cloudflare block page detected during status confirmation")
+    raise_if_blocked(lowered, "Djinni/Cloudflare block page detected during status confirmation")
 
     soup = BeautifulSoup(response.content, "html.parser")
     text_value = soup.get_text(" ", strip=True)
@@ -455,9 +528,7 @@ def confirm_unknown_jobs(args, deadline_monotonic=None):
         if not rows:
             return 0
 
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        scraper = create_djinni_scraper()
         errors = 0
         for position, row in enumerate(rows):
             if not job_confirmation_budget_available(deadline_monotonic):
@@ -560,6 +631,10 @@ def parse_args():
         "--no-structural-retry", action="store_true",
         help="Do not retry one full scan when the first scan is structurally partial.",
     )
+    parser.add_argument(
+        "--detail-refresh-limit", type=int, default=0,
+        help="Budgeted re-fetch of salary/tags/validThrough for active jobs (0=off).",
+    )
     args = parser.parse_args()
 
     if args.start_page < 1:
@@ -570,6 +645,8 @@ def parse_args():
         parser.error("invalid detail sleep range")
     if args.page_sleep_min < 0 or args.page_sleep_max < args.page_sleep_min:
         parser.error("invalid page sleep range")
+    if args.detail_refresh_limit < 0:
+        parser.error("--detail-refresh-limit must be non-negative")
     return args
 
 
@@ -609,6 +686,10 @@ def main():
         confirmation_result = confirm_unknown_jobs(args, deadline)
         if result == 0:
             result = confirmation_result
+    if not args.dry_run and result in (0, 2) and args.detail_refresh_limit > 0:
+        refresh_result = refresh_active_job_details(args, deadline)
+        if result == 0:
+            result = refresh_result
 
     # Telegram heartbeat: Djinni runs used to report nothing at all.
     # result 0 = clean run, anything else means a partial/failed cycle.

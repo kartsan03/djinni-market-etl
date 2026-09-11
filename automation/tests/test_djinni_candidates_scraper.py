@@ -41,9 +41,15 @@ class CandidateParserTests(unittest.TestCase):
     def test_confirmation_only_capacity_defaults(self):
         with patch("sys.argv", ["scraper_djinni_candidates.py"]):
             args = parse_args()
+        self.assertTrue(args.confirmation_only)
         self.assertEqual(args.confirmation_limit, 1000)
         self.assertEqual(args.deadline_minutes, 330.0)
         self.assertEqual((args.detail_sleep_min, args.detail_sleep_max), (7.0, 14.0))
+
+    def test_discovery_flag_is_refused(self):
+        with patch("sys.argv", ["scraper_djinni_candidates.py", "--no-confirmation-only"]):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
     def test_missing_view_count_stays_unknown(self):
         self.assertIsNone(clean_count(None))

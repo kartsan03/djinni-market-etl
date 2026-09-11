@@ -51,6 +51,21 @@ class ListingParserTests(unittest.TestCase):
         self.assertIsNone(record["apps_count"])
 
 
+    def test_parses_ua_engagement_counters(self):
+        soup = BeautifulSoup(
+            """
+            <div class="job-item">
+              <a class="job_item__header-link" href="/jobs/99-example/">Example</a>
+              <span>10 переглядів</span><span>3 відгуків</span>
+            </div>
+            """,
+            "html.parser",
+        )
+        record = parse_card(soup.select_one(".job-item"), page=1, position_on_page=1)
+        self.assertEqual(record["views_count"], 10)
+        self.assertEqual(record["apps_count"], 3)
+
+
 class AbsenceSafetyTests(unittest.TestCase):
     def safe(self, **overrides):
         values = {

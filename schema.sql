@@ -71,7 +71,6 @@ CREATE TABLE public.djinni_jobs (
     salary_period TEXT,
     salary_source TEXT,
     exp_selector_months INTEGER,
-    exp_text_extracted TEXT,
     description TEXT,
     url TEXT,
     published_at TIMESTAMPTZ,
