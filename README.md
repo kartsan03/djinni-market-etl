@@ -14,7 +14,7 @@ What it is not: no login or authenticated scraping, no contact extraction, no pr
 
 ## Status note: candidate listing access
 
-Since August 2026 Djinni redirects the `/developers/` listing to `/login` for anonymous visitors, so candidate *discovery* (walking the listing) is paused. Already-known public `/q/{key}/` profile URLs remain readable, and the candidate scraper runs in a **confirmation-only** mode against the stored cohort: profiles already collected continue to receive real detail/status checks on their confirmation schedule, so the collected history keeps maturing even without new discovery. The listing-discovery machinery is kept in the codebase and covered by tests; the run-audit tables record explicitly when a run was confirmation-only (`run_kind`) and that coverage was never global (`global_coverage = false`).
+Since August 2026 Djinni redirects the `/developers/` listing to `/login` for anonymous visitors, so candidate *discovery* (walking the listing) is paused. Already-known public `/q/{key}/` profile URLs remain readable, and the candidate scraper runs in a **confirmation-only** mode against the stored cohort: profiles already collected continue to receive real detail/status checks on their confirmation schedule, so the collected history keeps maturing even without new discovery. Listing/profile *parsers* remain in the codebase and are covered by unit tests; the live discovery loop is refused fail-loud. The run-audit tables record explicitly when a run was confirmation-only (`run_kind`) and that coverage was never global (`global_coverage = false`).
 
 Candidate data is treated as supply-side context for aggregate analysis only. Keep what you collect local; don't republish it.
 
@@ -24,7 +24,7 @@ Three scripts under `automation/`:
 
 - `scraper_djinni_jobs.py` — walks the job listing, ingests unseen postings from their JSON-LD detail pages, then delegates to the reconciler. One run = one audited cycle inside a time budget.
 - `reconcile_djinni_jobs.py` — the core of the system. Re-scans the listing, records an immutable observation per seen job per run, and applies the lifecycle state machine below. Never fetches every detail page: absence evidence plus targeted confirmations are enough.
-- `scraper_djinni_candidates.py` — incremental frontier discovery of candidate profiles plus scheduled confirmation batches for the monitored cohort, with per-run budget accounting.
+- `scraper_djinni_candidates.py` — confirmation-only checks against the stored candidate cohort (listing discovery refused since the Aug 2026 login wall), with per-run budget accounting.
 
 ### Job lifecycle state machine
 
@@ -98,18 +98,19 @@ psql -v ON_ERROR_STOP=1 -f schema.sql
 
 ## Usage
 
-Both scrapers accept `--dry-run` (parse and report, write nothing). Always start there.
+Jobs accept `--dry-run` (parse and report, write nothing). Always start there for jobs.
 
 Jobs — one full audited cycle (listing scan + detail ingest of unseen jobs + status confirmations):
 
 ```
-python automation/scraper_djinni_jobs.py
+# dry-run first
+python automation/scraper_djinni_jobs.py --dry-run
 # optional: budgeted refresh of salary/tags/validThrough on active jobs
 # python automation/scraper_djinni_jobs.py --detail-refresh-limit 25 --max-pages 2 --dry-run
 python automation/scraper_djinni_jobs.py
 ```
 
-Candidates — currently the confirmation-only mode described above:
+Candidates — confirmation-only against the stored cohort (no `--dry-run`; discovery is refused):
 
 ```
 python automation/scraper_djinni_candidates.py --confirmation-only
@@ -132,7 +133,7 @@ schema.sql                              baseline schema for a fresh deployment
 automation/
   scraper_djinni_jobs.py                jobs listing + detail ingest, one audited cycle
   reconcile_djinni_jobs.py              lifecycle state machine, observations, safety gates
-  scraper_djinni_candidates.py          frontier discovery + monitored-cohort confirmations
+  scraper_djinni_candidates.py          monitored-cohort confirmations (discovery refused)
   telegram_alert.py                     optional heartbeat (no-op without config)
   migrations/                           historical schema journal (see its README)
   tests/                                offline unit tests
