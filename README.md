@@ -2,6 +2,8 @@
 
 **Status:** jobs OK · candidates confirmation-only since Aug 2026
 
+Analysis recipes: [docs/analysis.md](docs/analysis.md).
+
 [![ci](https://github.com/kartsan03/djinni-market-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/kartsan03/djinni-market-etl/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](requirements.txt)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -101,7 +103,9 @@ Both scrapers accept `--dry-run` (parse and report, write nothing). Always start
 Jobs — one full audited cycle (listing scan + detail ingest of unseen jobs + status confirmations):
 
 ```
-python automation/scraper_djinni_jobs.py --max-pages 2 --dry-run
+python automation/scraper_djinni_jobs.py
+# optional: budgeted refresh of salary/tags/validThrough on active jobs
+# python automation/scraper_djinni_jobs.py --detail-refresh-limit 25 --max-pages 2 --dry-run
 python automation/scraper_djinni_jobs.py
 ```
 
