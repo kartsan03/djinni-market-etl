@@ -8,20 +8,22 @@ import time
 from datetime import date, datetime, timedelta
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
-import cloudscraper
 from bs4 import BeautifulSoup, Tag
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+from djinni_http import (
+    HEADERS,
+    BlockedResponseError,
+    create_djinni_scraper,
+    raise_if_blocked,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 BASE_URL = "https://djinni.co"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-}
 
 PARSER_VERSION = "candidate-lifecycle-v3"
 CANDIDATE_LOCK_KEY = 774_202_607
@@ -29,7 +31,6 @@ ACTIVE_CONFIRMATION_DAYS = 14
 INACTIVE_CONFIRMATION_DAYS = 30
 DETAIL_BUDGET_SECONDS = 14
 DETAIL_DEADLINE_BUFFER_SECONDS = 60
-BLOCK_MARKERS = ("has been blocked", "cf-chl-")
 OFFLINE_MARKERS = (
     "candidate is offline",
     "profile is offline",
@@ -463,10 +464,6 @@ class AmbiguousDetailError(RuntimeError):
     pass
 
 
-class BlockedResponseError(RuntimeError):
-    pass
-
-
 def parse_listing_meta(soup):
     heading = soup.find("h1")
     heading_text = normalize(heading.get_text(" ", strip=True)) if heading else None
@@ -488,8 +485,7 @@ def classify_candidate_detail_response(response, url):
 
     response.raise_for_status()
     lowered_html = response.text.lower()
-    if any(marker in lowered_html for marker in BLOCK_MARKERS):
-        raise BlockedResponseError("Djinni/Cloudflare block page detected")
+    raise_if_blocked(lowered_html)
 
     soup = BeautifulSoup(response.content, "html.parser")
     offline_evidence = []
@@ -963,6 +959,11 @@ def passes_new_candidate_filters(record, args):
 
 
 def run_incremental_listing(engine, scraper, args, run_id, prior_frontier, known, metrics, deadline):
+    raise RuntimeError(
+        "Candidate listing discovery path invoked but is fail-loud: "
+        "/developers/ is behind a login wall for anonymous visitors."
+    )
+    # Unreachable discovery implementation retained for reference/tests of parsers.
     page = args.start_page
     last_page = args.start_page + args.max_pages - 1 if args.max_pages else None
     seen_keys = set()
@@ -988,8 +989,7 @@ def run_incremental_listing(engine, scraper, args, run_id, prior_frontier, known
             break
         response.raise_for_status()
         lowered = response.text.lower()
-        if any(marker in lowered for marker in BLOCK_MARKERS):
-            raise BlockedResponseError("Djinni blocked the listing request")
+        raise_if_blocked(lowered, "Djinni blocked the listing request")
 
         soup = BeautifulSoup(response.content, "html.parser")
         cards = soup.select(".card.mb-4")
@@ -1338,9 +1338,13 @@ def run_confirmations(engine, scraper, args, run_id, metrics, deadline):
 
 
 def scrape_candidates(args):
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
+    if not args.confirmation_only:
+        raise RuntimeError(
+            "Candidate listing discovery is refused: anonymous /developers/ "
+            "redirects to /login since Aug 2026. Run in confirmation-only mode "
+            "(default). Discovery code remains for tests but must not be invoked."
+        )
+    scraper = create_djinni_scraper()
     metrics = initial_metrics()
     deadline = datetime.now() + timedelta(minutes=args.deadline_minutes)
     listing_deadline = min(
@@ -1425,7 +1429,7 @@ def scrape_candidates(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Incrementally discover Djinni candidates and confirm a monitored cohort safely."
+        description="Confirm a monitored Djinni candidate cohort (confirmation-only by default)."
     )
     parser.add_argument("--min-views", type=int, default=0)
     parser.add_argument("--min-salary", type=int, default=0)
@@ -1439,8 +1443,10 @@ def parse_args():
         help="Bound newly tracked listing-only profiles so the detail batch can catch up.",
     )
     parser.add_argument(
-        "--confirmation-only", action="store_true",
-        help="Skip listing discovery and process only the due monitored detail batch.",
+        "--confirmation-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Confirm stored cohort only (default). --no-confirmation-only attempts discovery and is refused.",
     )
     parser.add_argument("--frontier-key-pages", type=int, default=3)
     parser.add_argument("--frontier-overlap-pages", type=int, default=2)
@@ -1454,8 +1460,15 @@ def parse_args():
     parser.add_argument("--page-sleep-max", type=float, default=20.0)
     args = parser.parse_args()
 
-    if args.confirmation_only and args.dry_run:
-        parser.error("--confirmation-only cannot be combined with --dry-run")
+    if not args.confirmation_only:
+        parser.error(
+            "Candidate listing discovery is refused: anonymous /developers/ "
+            "redirects to /login since Aug 2026. Omit --no-confirmation-only."
+        )
+    if args.dry_run:
+        parser.error(
+            "--dry-run only exercised listing discovery, which is refused (login wall)."
+        )
     if args.start_page < 1:
         parser.error("--start-page must be >= 1")
     if args.max_pages is not None and args.max_pages < 1:
