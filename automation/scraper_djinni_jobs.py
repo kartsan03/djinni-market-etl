@@ -388,6 +388,7 @@ def update_job_detail_fields(engine, djinni_id, detail):
     params = {
         **detail,
         "djinni_id": djinni_id,
+        "tags": detail["tags"] or None,
         "raw_json_ld": json.dumps(detail["raw_json_ld"], ensure_ascii=False),
         "parser_version": PARSER_VERSION,
     }
@@ -395,13 +396,13 @@ def update_job_detail_fields(engine, djinni_id, detail):
         conn.execute(text("""
             UPDATE public.djinni_jobs
             SET
-                salary_min = :salary_min,
-                salary_max = :salary_max,
-                salary_currency = :salary_currency,
-                salary_period = :salary_period,
-                salary_source = :salary_source,
-                valid_through = :valid_through,
-                tags = :tags,
+                salary_min = COALESCE(:salary_min, salary_min),
+                salary_max = COALESCE(:salary_max, salary_max),
+                salary_currency = COALESCE(:salary_currency, salary_currency),
+                salary_period = COALESCE(:salary_period, salary_period),
+                salary_source = COALESCE(:salary_source, salary_source),
+                valid_through = COALESCE(:valid_through, valid_through),
+                tags = COALESCE(:tags, tags),
                 exp_selector_months = :experience_months,
                 raw_json_ld = CAST(:raw_json_ld AS jsonb),
                 detail_scraped_at = CURRENT_TIMESTAMP,
